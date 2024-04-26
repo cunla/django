@@ -19,6 +19,8 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     sql_delete_column = "ALTER TABLE %(table)s DROP COLUMN %(column)s"
     sql_create_unique = "CREATE UNIQUE INDEX %(name)s ON %(table)s (%(columns)s)"
     sql_delete_unique = "DROP INDEX %(name)s"
+    sql_alter_table_comment = None
+    sql_alter_column_comment = None
 
     def __enter__(self):
         # Some SQLite schema alterations need foreign key constraints to be
@@ -107,6 +109,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         mapping = {
             f.column: self.quote_name(f.column)
             for f in model._meta.local_concrete_fields
+            if f.generated is False
         }
         # This maps field names (not columns) for things like unique_together
         rename_mapping = {}
@@ -147,6 +150,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             body.pop(old_field.name, None)
             mapping.pop(old_field.column, None)
             body[new_field.name] = new_field
+            rename_mapping[old_field.name] = new_field.name
+            if new_field.generated:
+                continue
             if old_field.null and not new_field.null:
                 if new_field.db_default is NOT_PROVIDED:
                     default = self.prepare_default(self.effective_default(new_field))
@@ -159,11 +165,10 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 mapping[new_field.column] = case_sql
             else:
                 mapping[new_field.column] = self.quote_name(old_field.column)
-            rename_mapping[old_field.name] = new_field.name
         # Remove any deleted fields
         if delete_field:
             del body[delete_field.name]
-            del mapping[delete_field.column]
+            mapping.pop(delete_field.column, None)
             # Remove any implicit M2M tables
             if (
                 delete_field.many_to_many
@@ -225,6 +230,14 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         body_copy["Meta"] = meta
         body_copy["__module__"] = model.__module__
         new_model = type("New%s" % model._meta.object_name, model.__bases__, body_copy)
+
+        # Remove the automatically recreated default primary key, if it has
+        # been deleted.
+        if delete_field and delete_field.attname == new_model._meta.pk.attname:
+            auto_pk = new_model._meta.pk
+            delattr(new_model, auto_pk.attname)
+            new_model._meta.local_fields.remove(auto_pk)
+            new_model.pk = None
 
         # Create a new table with the updated schema.
         self.create_model(new_model)
